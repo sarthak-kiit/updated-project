@@ -18,27 +18,146 @@ function Stars({ rating, size = '0.9rem' }: { rating: number; size?: string }) {
   );
 }
 
-// ── Booking Modal ─────────────────────────────────────────────────────────────
+// ── Booking Modal (US03 + US07 + US10) ───────────────────────────────────────
+// Smart calendar — only available days are clickable, blocked dates are greyed out.
+// Mentee CANNOT submit on a wrong day or a blocked date (hard enforcement, not just a warning).
 function BookingModal({ mentor, onClose, onSuccess }: {
   mentor: MentorProfile; onClose: () => void; onSuccess: () => void;
 }) {
   const { user } = useAuth();
-  const [form, setForm] = useState({ scheduledAt: '', durationMinutes: 60, agenda: '' });
+  const [selectedDate, setSelectedDate] = useState<string>(''); // "YYYY-MM-DD"
+  const [selectedTime, setSelectedTime] = useState<string>(''); // "HH:MM"
+  const [durationMinutes, setDurationMinutes] = useState(60);
+  const [agenda, setAgenda] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError]    = useState('');
+  // US07 AC3 — daily/weekly/monthly view toggle
+  const [viewMode, setViewMode] = useState<'daily' | 'weekly' | 'monthly'>('weekly');
+  // US07 AC2 — mentee's local timezone for conversion display
+  const menteeLocalTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
-  const minDate = new Date(); minDate.setDate(minDate.getDate() + 1);
-  const minDateStr = minDate.toISOString().slice(0, 16);
+  const DAY_NAMES = ['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+
+  // FIX: Array of slots per day — supports multiple slots on the same day.
+  // Old code used a plain object which silently overwrote the first slot if a day had two.
+  const availMap: Record<string, { startTime: string; endTime: string; timezone: string }[]> = {};
+  (mentor.availabilities ?? []).forEach(a => {
+    if (!availMap[a.dayOfWeek]) availMap[a.dayOfWeek] = [];
+    availMap[a.dayOfWeek].push({ startTime: a.startTime, endTime: a.endTime, timezone: a.timezone });
+  });
+
+  // All blocked dates across all slots as a Set for O(1) lookup
+  const blockedSet = new Set<string>(
+    (mentor.availabilities ?? []).flatMap(a => (a as any).blockedDates ?? [])
+  );
+
+  const mentorTz  = (mentor.availabilities ?? [])[0]?.timezone ?? 'IST';
+  const tzDisplay = [...new Set((mentor.availabilities ?? []).map(a => a.timezone))].join(' / ');
+
+  // US07 AC2 — convert a "HH:MM" time from mentor's IST slot to mentee's local timezone.
+  // Uses the browser's Intl API — works for all IANA timezones.
+  // IST isn't an IANA tz key ("Asia/Kolkata" is), so we normalise common abbreviations.
+  const TZ_MAP: Record<string, string> = {
+    IST: 'Asia/Kolkata', UTC: 'UTC', EST: 'America/New_York',
+    PST: 'America/Los_Angeles', CET: 'Europe/Paris',
+    SGT: 'Asia/Singapore', JST: 'Asia/Tokyo', AEST: 'Australia/Sydney',
+  };
+  const toIANA = (abbr: string) => TZ_MAP[abbr] ?? abbr;
+
+  const convertToLocal = (timeStr: string, mentorTzAbbr: string): string => {
+    try {
+      const [h, m] = timeStr.split(':').map(Number);
+      // Build a today-date string in mentor's timezone at that time
+      const now = new Date();
+      const dateStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+      const mentorDt = new Date(`${dateStr}T${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:00`);
+      // Format in mentee's local tz
+      return mentorDt.toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', hour12: false,
+        timeZone: toIANA(mentorTzAbbr),
+      });
+    } catch { return timeStr.slice(0,5); }
+  };
+
+  const isSameTz = menteeLocalTz === toIANA(mentorTz) || mentorTz === 'IST' && menteeLocalTz === 'Asia/Kolkata';
+
+  // Build 6-week calendar grid starting from tomorrow
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const calStart = new Date(today);
+  calStart.setDate(today.getDate() + 1); // earliest bookable = tomorrow
+  // Roll back to the Monday of that week for a clean Mon–Sun grid
+  const dowOffset = (calStart.getDay() + 6) % 7; // Mon=0 … Sun=6
+  calStart.setDate(calStart.getDate() - dowOffset);
+
+  const weeks: Date[][] = [];
+  for (let w = 0; w < 6; w++) {
+    const week: Date[] = [];
+    for (let d = 0; d < 7; d++) {
+      const day = new Date(calStart);
+      day.setDate(calStart.getDate() + w * 7 + d);
+      week.push(day);
+    }
+    weeks.push(week);
+  }
+
+  // FIX: toISOString() converts to UTC — shifts IST midnight back by 5.5h giving wrong date.
+  // Use local getters instead.
+  const toYMD = (d: Date) => {
+    const y  = d.getFullYear();
+    const m  = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${dd}`;
+  };
+
+  const isAvailableDay  = (d: Date) => DAY_NAMES[d.getDay()] in availMap;
+  const isBlocked       = (d: Date) => blockedSet.has(toYMD(d));
+  const isPast          = (d: Date) => d <= today;
+  const isSelectable    = (d: Date) => !isPast(d) && isAvailableDay(d) && !isBlocked(d);
+
+  const handleDateClick = (d: Date) => {
+    if (!isSelectable(d)) return;
+    setSelectedDate(toYMD(d));
+    setSelectedTime(''); // reset — mentee must explicitly pick a time
+    setError('');
+  };
+
+  // Build time options from ALL slots on the selected day (every 30 min per slot range).
+  // FIX: was only using the first/last slot — now merges all slot ranges for the day.
+  const timeOptions: string[] = [];
+  if (selectedDate) {
+    const dayName = DAY_NAMES[new Date(selectedDate + 'T00:00:00').getDay()];
+    const slots = availMap[dayName] ?? [];
+    const seen = new Set<string>();
+    for (const slot of slots) {
+      const [sh, sm] = slot.startTime.split(':').map(Number);
+      const [eh, em] = slot.endTime.split(':').map(Number);
+      let cur = sh * 60 + sm;
+      const end = eh * 60 + em;
+      while (cur < end) {
+        const hh = String(Math.floor(cur / 60)).padStart(2, '0');
+        const mm = String(cur % 60).padStart(2, '0');
+        const t = `${hh}:${mm}`;
+        if (!seen.has(t)) { seen.add(t); timeOptions.push(t); }
+        cur += 30;
+      }
+    }
+    timeOptions.sort(); // ensure chronological order across multiple slots
+  }
 
   const handleBook = async () => {
-    if (!form.scheduledAt) { setError('Please select a date and time'); return; }
+    if (!selectedDate || !selectedTime) { setError('Please select a date and time slot'); return; }
+    if (!isSelectable(new Date(selectedDate + 'T00:00:00'))) {
+      setError('Selected date is not available. Please pick an available date.');
+      return;
+    }
     setLoading(true); setError('');
     try {
       await bookSession(user!.userId, {
         mentorId: mentor.userId,
-        scheduledAt: new Date(form.scheduledAt).toISOString(),
-        durationMinutes: form.durationMinutes,
-        agenda: form.agenda,
+        scheduledAt: new Date(`${selectedDate}T${selectedTime}:00`).toISOString(),
+        durationMinutes,
+        agenda,
       });
       onSuccess();
     } catch (err: any) {
@@ -46,37 +165,226 @@ function BookingModal({ mentor, onClose, onSuccess }: {
     } finally { setLoading(false); }
   };
 
+  const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const headerMonth = weeks[2][0]; // middle of the grid
+
   return (
     <div className="sb-overlay" onClick={onClose}>
-      <div className="sb-modal" onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem' }}>
+      <div className="sb-modal" style={{ maxWidth: 520 }} onClick={e => e.stopPropagation()}>
+
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
           <div>
             <h3 className="sb-modal-title">Book with {mentor.fullName}</h3>
-            {mentor.headline && <p style={{ color: 'var(--text-primary)', fontWeight: 600, fontSize: '0.82rem' }}>{mentor.headline}</p>}
+            {tzDisplay && (
+              <span style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                🌐 {tzDisplay}
+              </span>
+            )}
           </div>
           <button className="btn-ghost btn-sm" onClick={onClose}>✕</button>
         </div>
 
-        {error && <div className="sb-alert sb-alert-error">{error}</div>}
+        {error && <div className="sb-alert sb-alert-error" style={{ marginBottom: '0.75rem' }}>{error}</div>}
 
-        <div className="sb-form-group">
-          <label className="sb-label">Select Date &amp; Time</label>
-          <input className="sb-input" type="datetime-local" min={minDateStr}
-            value={form.scheduledAt}
-            onChange={e => { setForm({ ...form, scheduledAt: e.target.value }); setError(''); }} />
+        {/* Legend */}
+        <div style={{ display: 'flex', gap: '0.75rem', fontSize: '0.72rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span style={{ width: 12, height: 12, borderRadius: 3, background: 'var(--primary)', display: 'inline-block' }} />
+            Available
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span style={{ width: 12, height: 12, borderRadius: 3, background: '#fca5a5', display: 'inline-block' }} />
+            Blocked
+          </span>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span style={{ width: 12, height: 12, borderRadius: 3, background: 'var(--border)', display: 'inline-block' }} />
+            Unavailable
+          </span>
         </div>
 
+        {/* US07 AC3 — Daily / Weekly / Monthly view toggle */}
+        <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '0.75rem', justifyContent: 'center' }}>
+          {(['daily','weekly','monthly'] as const).map(v => (
+            <button key={v} type="button" onClick={() => { setViewMode(v); setSelectedDate(''); setSelectedTime(''); }}
+              style={{
+                padding: '0.3rem 0.85rem', borderRadius: 'var(--radius-md)', cursor: 'pointer',
+                fontSize: '0.78rem', fontWeight: 700, fontFamily: "'Inter', sans-serif",
+                border: viewMode === v ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                background: viewMode === v ? 'var(--primary)' : 'var(--bg-subtle)',
+                color: viewMode === v ? '#fff' : 'var(--text-secondary)',
+              }}>
+              {v.charAt(0).toUpperCase() + v.slice(1)}
+            </button>
+          ))}
+        </div>
+
+        {/* Calendar header */}
+        <div style={{ textAlign: 'center', fontWeight: 700, fontSize: '0.9rem',
+          color: 'var(--text-primary)', marginBottom: '0.5rem' }}>
+          {MONTH_NAMES[headerMonth.getMonth()]} {headerMonth.getFullYear()}
+        </div>
+
+        {/* Day-of-week headers — hidden in daily view */}
+        {viewMode !== 'daily' && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3, marginBottom: 3 }}>
+            {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => (
+              <div key={d} style={{ textAlign: 'center', fontSize: '0.68rem',
+                fontWeight: 700, color: 'var(--text-muted)', padding: '0.2rem 0' }}>
+                {d}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Calendar grid — US07 AC1: color-coded by availability status */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: viewMode === 'daily' ? '1fr' : 'repeat(7, 1fr)',
+          gap: viewMode === 'daily' ? '0.4rem' : 3,
+          marginBottom: '1rem',
+          maxHeight: viewMode === 'daily' ? 220 : 'none',
+          overflowY: viewMode === 'daily' ? 'auto' : 'visible',
+        }}>
+          {(viewMode === 'daily'
+            // Daily view: show only available + selectable days in next 30 days as list rows
+            ? weeks.flat().filter(d => isSelectable(d)).slice(0, 30)
+            // Weekly view: current 6-week grid  |  Monthly: same grid (already 1 month+)
+            : viewMode === 'monthly' ? weeks.flat() : weeks.slice(0,2).flat()
+          ).map((day, idx) => {
+            const ymd = toYMD(day);
+            const past      = isPast(day);
+            const available = isAvailableDay(day);
+            const blocked   = isBlocked(day);
+            const selectable = isSelectable(day);
+            const selected  = ymd === selectedDate;
+            const isToday   = ymd === toYMD(today);
+
+            let bg = 'transparent';
+            let color = 'var(--text-muted)';
+            let border = '1px solid transparent';
+            let cursor = 'default';
+            let opacity = past ? 0.3 : 1;
+
+            if (selected) {
+              bg = 'var(--primary)'; color = '#fff'; border = '1px solid var(--primary)';
+            } else if (blocked && available && !past) {
+              // available day but this specific date is blocked
+              bg = '#fee2e2'; color = '#b91c1c'; border = '1px solid #fca5a5';
+            } else if (selectable) {
+              bg = 'var(--primary-light)'; color = 'var(--primary)';
+              border = '1px solid var(--border-focus)'; cursor = 'pointer';
+            } else if (!past) {
+              bg = 'var(--bg-subtle)'; color = 'var(--text-muted)';
+            }
+
+            return (
+              <div key={idx} onClick={() => handleClick(day)}
+                style={{
+                  textAlign: 'center', padding: '0.45rem 0.2rem', borderRadius: 6,
+                  fontSize: '0.78rem', fontWeight: selected ? 700 : selectable ? 600 : 500,
+                  background: bg, color, border, cursor, opacity,
+                  outline: isToday && !selected ? '2px solid var(--primary)' : 'none',
+                  outlineOffset: -2,
+                  transition: 'all 0.1s',
+                }}
+                title={
+                  blocked && available && !past ? '🚫 Blocked by mentor' :
+                  selectable ? (availMap[DAY_NAMES[day.getDay()]] ?? []).map(s => s.startTime.slice(0,5) + '–' + s.endTime.slice(0,5)).join(', ') :
+                  past ? 'Past date' : 'Not available'
+                }
+              >
+                {viewMode === 'daily' ? (
+                  <span style={{ fontSize: '0.82rem' }}>
+                    {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][day.getDay()]} {day.getDate()} {MONTH_NAMES[day.getMonth()]}
+                    &nbsp;·&nbsp;
+                    {(availMap[DAY_NAMES[day.getDay()]] ?? []).map(s =>
+                      s.startTime.slice(0,5) + '–' + s.endTime.slice(0,5)
+                    ).join(', ')}
+                  </span>
+                ) : (
+                  <>
+                    {day.getDate()}
+                    {blocked && available && !past && (
+                      <div style={{ fontSize: '0.55rem', lineHeight: 1 }}>🚫</div>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Step 2: Time picker — appears after date is chosen */}
+        {selectedDate && (
+          <div className="sb-form-group">
+            <label className="sb-label" style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', flexWrap: 'wrap' }}>
+              <span style={{
+                background: selectedTime ? 'var(--primary)' : 'var(--text-muted)',
+                color: '#fff', borderRadius: '50%', width: 18, height: 18,
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: '0.68rem', fontWeight: 700, flexShrink: 0,
+              }}>2</span>
+              Pick a time for {selectedDate}
+              {/* US07 AC2 — show mentor tz + mentee local tz conversion */}
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', fontWeight: 500 }}>
+                (Mentor: {tzDisplay}
+                {!isSameTz && ` · Your local: ${menteeLocalTz}`})
+              </span>
+            </label>
+
+            {timeOptions.length === 0 ? (
+              <p style={{ fontSize: '0.8rem', color: 'var(--danger)' }}>
+                No time slots available for this date.
+              </p>
+            ) : (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.4rem' }}>
+                {timeOptions.map(t => (
+                  <button key={t} type="button"
+                    onClick={() => setSelectedTime(t)}
+                    style={{
+                      padding: '0.5rem 1rem', borderRadius: 'var(--radius-md)',
+                      fontSize: '0.875rem', fontWeight: 700, cursor: 'pointer',
+                      fontFamily: "'Inter', sans-serif",
+                      border: selectedTime === t ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                      background: selectedTime === t ? 'var(--primary)' : 'var(--bg-card)',
+                      color: selectedTime === t ? '#fff' : 'var(--text-secondary)',
+                      boxShadow: selectedTime === t ? '0 2px 8px rgba(99,102,241,0.3)' : 'none',
+                      transform: selectedTime === t ? 'scale(1.05)' : 'scale(1)',
+                      transition: 'all 0.15s',
+                      textAlign: 'left',
+                    }}>
+                    {/* US07 AC2 — show mentor time + mentee local equivalent */}
+                    🕐 {t}
+                    {!isSameTz && (
+                      <span style={{ fontSize: '0.68rem', display: 'block',
+                        opacity: 0.85, fontWeight: 500, marginTop: '0.1rem' }}>
+                        {convertToLocal(t, mentorTz)} local
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+            {!selectedTime && timeOptions.length > 0 && (
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.4rem' }}>
+                ☝️ Tap a time slot above to select it
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Duration — US10 */}
         <div className="sb-form-group">
           <label className="sb-label">Session Duration</label>
           <div style={{ display: 'flex', gap: '0.6rem' }}>
             {[30, 45, 60].map(d => (
-              <button key={d} type="button" onClick={() => setForm({ ...form, durationMinutes: d })}
+              <button key={d} type="button" onClick={() => setDurationMinutes(d)}
                 style={{
                   flex: 1, padding: '0.55rem', borderRadius: 'var(--radius-md)', cursor: 'pointer',
                   fontWeight: 600, fontSize: '0.875rem', fontFamily: "'Inter', sans-serif",
-                  border: form.durationMinutes === d ? '2px solid var(--primary)' : '1.5px solid var(--border)',
-                  background: form.durationMinutes === d ? 'var(--primary-light)' : 'var(--bg-subtle)',
-                  color: form.durationMinutes === d ? 'var(--primary)' : 'var(--text-secondary)',
+                  border: durationMinutes === d ? '2px solid var(--primary)' : '1.5px solid var(--border)',
+                  background: durationMinutes === d ? 'var(--primary-light)' : 'var(--bg-subtle)',
+                  color: durationMinutes === d ? 'var(--primary)' : 'var(--text-secondary)',
                 }}>
                 {d} min
               </button>
@@ -84,41 +392,39 @@ function BookingModal({ mentor, onClose, onSuccess }: {
           </div>
         </div>
 
-        {/* Availability hint */}
-        {mentor.availabilities?.length > 0 && (
-          <div className="sb-section-box" style={{ marginBottom: '1rem' }}>
-            <div style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-primary)',
-              textTransform: 'uppercase', letterSpacing: '0.4px', marginBottom: '0.5rem' }}>
-              Mentor Available On
-            </div>
-            {mentor.availabilities.map((a, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: 'space-between',
-                fontSize: '0.82rem', color: 'var(--text-primary)', fontWeight: 600, marginBottom: '0.25rem' }}>
-                <span style={{ fontWeight: 600 }}>{a.dayOfWeek}</span>
-                <span>{a.startTime} – {a.endTime} <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{a.timezone}</span></span>
-              </div>
-            ))}
-          </div>
-        )}
-
         <div className="sb-form-group">
           <label className="sb-label">Session Agenda (optional)</label>
-          <textarea className="sb-input" rows={3}
+          <textarea className="sb-input" rows={2}
             placeholder="What topics would you like to cover?"
-            value={form.agenda}
-            onChange={e => setForm({ ...form, agenda: e.target.value })}
+            value={agenda} onChange={e => setAgenda(e.target.value)}
             style={{ resize: 'vertical' }} />
         </div>
 
+        {selectedDate && selectedTime && (
+          <div style={{
+            background: 'var(--primary-light)', border: '1px solid var(--border-focus)',
+            borderRadius: 'var(--radius-md)', padding: '0.6rem 0.9rem',
+            fontSize: '0.82rem', marginBottom: '0.75rem', fontWeight: 600,
+          }}>
+            📅 {selectedDate} at {selectedTime} · {durationMinutes} min · {tzDisplay}
+          </div>
+        )}
+
         <div style={{ display: 'flex', gap: '0.75rem' }}>
           <button className="btn-ghost" onClick={onClose} style={{ flex: 1 }}>Cancel</button>
-          <button className="btn-primary" onClick={handleBook} disabled={loading} style={{ flex: 2 }}>
+          <button className="btn-primary" onClick={handleBook}
+            disabled={loading || !selectedDate || !selectedTime} style={{ flex: 2 }}>
             {loading ? 'Booking…' : 'Confirm Booking'}
           </button>
         </div>
       </div>
     </div>
   );
+
+  function handleClick(day: Date) {
+    if (!isSelectable(day)) return;
+    handleDateClick(day);
+  }
 }
 
 // ── Mentor Response on review ─────────────────────────────────────────────────

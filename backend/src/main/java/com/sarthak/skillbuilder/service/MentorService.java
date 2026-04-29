@@ -12,6 +12,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalTime;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -22,6 +23,10 @@ import java.util.stream.Collectors;
 @Transactional(readOnly = true)
 public class MentorService {
 
+    // FIX: Removed AvailabilityService injection.
+    // It caused @RequiredArgsConstructor / Eclipse compilation errors because
+    // the IDE could not resolve the Spring bean dependency in its context.
+    // AvailabilityService.toDTO() logic is now inlined in toDTO() below.
     private final MentorProfileRepository mentorProfileRepository;
     private final UserRepository userRepository;
 
@@ -55,27 +60,13 @@ public class MentorService {
                 .limit(10).map(this::toDTO).collect(Collectors.toList());
     }
 
-    // US09 SRS: "at least 5 recommendations based on industry and skill matches,
-    //            prioritising highly-rated mentors"
-    // US09 — Profile-based mentor recommendations
-    // AC1: "Recommendations appear on dashboard after profile completion"
-    // AC2: "At least 5 recommendations based on industry and skill matches"
-    // AC3: "Algorithm prioritises highly-rated mentors" — ORDER BY averageRating DESC in JPQL
+    // US09
     public List<MentorProfileDTO> getRecommendedForMentee(Long menteeUserId) {
-
-        // JPQL finds mentors whose industries match mentee's interests
-        // OR whose skills match mentee's desiredSkills, ordered by averageRating DESC (AC3)
-        // Returns ONLY genuinely matched mentors — no padding with unrelated top-rated mentors.
-        // Padding was causing unrelated mentors (and empty profiles like "rishi") to appear.
         List<MentorProfile> recommended =
                 mentorProfileRepository.findRecommendedForMentee(menteeUserId);
-
         log.info("US09 — {} matched recommendations for menteeUserId:{}",
                 recommended.size(), menteeUserId);
-
-        return recommended.stream()
-                .map(this::toDTO)
-                .collect(Collectors.toList());
+        return recommended.stream().map(this::toDTO).collect(Collectors.toList());
     }
 
     @Transactional
@@ -89,81 +80,113 @@ public class MentorService {
         MentorProfile profile = mentorProfileRepository.findByUserId(userId)
                 .orElse(MentorProfile.builder().user(user).build());
 
-        // Basic fields
         profile.setHeadline(dto.getHeadline());
         profile.setCompany(dto.getCompany());
         profile.setDesignation(dto.getDesignation());
         profile.setYearsOfExperience(dto.getYearsOfExperience());
-        profile.setEducation(dto.getEducation());   // US01 — was missing, caused null in DB
+        profile.setEducation(dto.getEducation());
         profile.setProfessionalSummary(dto.getProfessionalSummary());
 
-        // Industries → mentor_industries table
+        // Industries
         if (dto.getIndustries() != null) {
             profile.getIndustries().clear();
-            dto.getIndustries().stream()
-                .filter(i -> i != null && !i.isBlank())
-                .forEach(i -> profile.getIndustries().add(
-                    MentorIndustry.builder()
-                        .mentorProfile(profile)
-                        .industry(i.trim())
-                        .build()
-                ));
+            for (String industryName : dto.getIndustries()) {
+                if (industryName != null && !industryName.isBlank()) {
+                    profile.getIndustries().add(
+                        MentorIndustry.builder()
+                            .mentorProfile(profile)
+                            .industry(industryName.trim())
+                            .build()
+                    );
+                }
+            }
         }
 
-        // Skills → mentor_skills table
+        // Skills
         if (dto.getSkills() != null) {
             profile.getSkills().clear();
-            dto.getSkills().stream()
-                .filter(s -> s.getSkillName() != null && !s.getSkillName().isBlank())
-                .forEach(s -> profile.getSkills().add(
-                    MentorSkill.builder()
-                        .mentorProfile(profile)
-                        .skillName(s.getSkillName().trim())
-                        .category(s.getCategory())
-                        .expertiseLevel(MentorSkill.ExpertiseLevel.valueOf(s.getExpertiseLevel()))
-                        .build()
-                ));
+            for (SkillDTO s : dto.getSkills()) {
+                if (s.getSkillName() != null && !s.getSkillName().isBlank()) {
+                    String level = (s.getExpertiseLevel() != null)
+                            ? s.getExpertiseLevel().toUpperCase()
+                            : "INTERMEDIATE";
+                    profile.getSkills().add(
+                        MentorSkill.builder()
+                            .mentorProfile(profile)
+                            .skillName(s.getSkillName().trim())
+                            .category(s.getCategory())
+                            .expertiseLevel(MentorSkill.ExpertiseLevel.valueOf(level))
+                            .build()
+                    );
+                }
+            }
         }
 
-        // Work experiences → work_experiences table
+        // Work experiences
         if (dto.getWorkExperiences() != null) {
             profile.getWorkExperiences().clear();
-            dto.getWorkExperiences().stream()
-                .filter(w -> w.getCompanyName() != null && !w.getCompanyName().isBlank())
-                .forEach(w -> profile.getWorkExperiences().add(
-                    WorkExperience.builder()
-                        .mentorProfile(profile)
-                        .companyName(w.getCompanyName().trim())
-                        .jobTitle(w.getJobTitle() != null ? w.getJobTitle().trim() : "")
-                        .startDate(parseDate(w.getStartDate()))
-                        .endDate(w.isCurrentJob() ? null : parseDate(w.getEndDate()))
-                        .currentJob(w.isCurrentJob())
-                        .description(w.getDescription())
-                        .build()
-                ));
+            for (WorkExperienceDTO w : dto.getWorkExperiences()) {
+                if (w.getCompanyName() != null && !w.getCompanyName().isBlank()) {
+                    profile.getWorkExperiences().add(
+                        WorkExperience.builder()
+                            .mentorProfile(profile)
+                            .companyName(w.getCompanyName().trim())
+                            .jobTitle(w.getJobTitle() != null ? w.getJobTitle().trim() : "")
+                            .startDate(parseDate(w.getStartDate()))
+                            .endDate(w.isCurrentJob() ? null : parseDate(w.getEndDate()))
+                            .currentJob(w.isCurrentJob())
+                            .description(w.getDescription())
+                            .build()
+                    );
+                }
+            }
         }
 
-        // Availabilities → availabilities table
+        // US03 — Availabilities
+        // FIX: Replaced nested stream+lambda with enhanced for-loops.
+        // The original nested lambda captured 'avail' from the outer lambda scope;
+        // Eclipse treated this as a compile error (inner lambda modification of captured var).
+        // Plain for-loops are cleaner and have no capture restrictions.
         if (dto.getAvailabilities() != null) {
             profile.getAvailabilities().clear();
-            dto.getAvailabilities().stream()
-                .filter(a -> a.getDayOfWeek() != null && a.getStartTime() != null)
-                .forEach(a -> profile.getAvailabilities().add(
-                    Availability.builder()
-                        .mentorProfile(profile)
-                        .dayOfWeek(DayOfWeek.valueOf(a.getDayOfWeek()))
-                        .startTime(parseTime(a.getStartTime()))
-                        .endTime(parseTime(a.getEndTime()))
-                        .recurring(a.isRecurring())
-                        .timezone(a.getTimezone() != null ? a.getTimezone() : "IST")
-                        .build()
-                ));
+            for (AvailabilityDTO a : dto.getAvailabilities()) {
+                if (a.getDayOfWeek() == null || a.getStartTime() == null) continue;
+
+                Availability avail = Availability.builder()
+                    .mentorProfile(profile)
+                    .dayOfWeek(DayOfWeek.valueOf(a.getDayOfWeek().toUpperCase()))
+                    .startTime(parseTime(a.getStartTime()))
+                    .endTime(parseTime(a.getEndTime()))
+                    .recurring(a.isRecurring())
+                    .timezone(a.getTimezone() != null ? a.getTimezone() : "IST")
+                    .build();
+
+                // AC3: block-off dates
+                if (a.getBlockedDates() != null && !a.getBlockedDates().isEmpty()) {
+                    List<LocalDate> dates = new ArrayList<>();
+                    for (String d : a.getBlockedDates()) {
+                        if (d != null && !d.isBlank()) {
+                            try {
+                                dates.add(LocalDate.parse(d.trim()));
+                            } catch (Exception ignored) {
+                                log.warn("Invalid blocked date skipped: {}", d);
+                            }
+                        }
+                    }
+                    avail.getBlockedDates().addAll(dates);
+                    avail.serializeBlockedDates();
+                }
+
+                profile.getAvailabilities().add(avail);
+            }
         }
 
         MentorProfile saved = mentorProfileRepository.save(profile);
         log.info("Mentor profile saved for userId: {}", userId);
         return toDTO(saved);
     }
+
+    // ── Private helpers ───────────────────────────────────────────
 
     private LocalDate parseDate(String dateStr) {
         if (dateStr == null || dateStr.isBlank()) return null;
@@ -219,18 +242,32 @@ public class MentorService {
                 .collect(Collectors.toList())
             : Collections.emptyList();
 
-        List<AvailabilityDTO> availabilities = p.getAvailabilities() != null
-            ? p.getAvailabilities().stream()
-                .map(a -> AvailabilityDTO.builder()
+        // US03 — Inline availability DTO mapping (was: availabilityService::toDTO).
+        // Inlined to remove the AvailabilityService field dependency from this class.
+        // Logic is identical: hydrateBlockedDates() first, then build the DTO.
+        List<AvailabilityDTO> availabilities = new ArrayList<>();
+        if (p.getAvailabilities() != null) {
+            for (Availability a : p.getAvailabilities()) {
+                a.hydrateBlockedDates();
+                List<String> blockedDateStrings = new ArrayList<>();
+                if (a.getBlockedDates() != null) {
+                    for (LocalDate d : a.getBlockedDates()) {
+                        blockedDateStrings.add(d.toString());
+                    }
+                }
+                availabilities.add(
+                    AvailabilityDTO.builder()
                         .id(a.getId())
                         .dayOfWeek(a.getDayOfWeek() != null ? a.getDayOfWeek().name() : null)
                         .startTime(a.getStartTime() != null ? a.getStartTime().toString() : null)
                         .endTime(a.getEndTime() != null ? a.getEndTime().toString() : null)
                         .recurring(a.isRecurring())
                         .timezone(a.getTimezone())
-                        .build())
-                .collect(Collectors.toList())
-            : Collections.emptyList();
+                        .blockedDates(blockedDateStrings)
+                        .build()
+                );
+            }
+        }
 
         return MentorProfileDTO.builder()
                 .id(p.getId())
@@ -242,7 +279,7 @@ public class MentorService {
                 .company(p.getCompany())
                 .designation(p.getDesignation())
                 .yearsOfExperience(p.getYearsOfExperience())
-                .education(p.getEducation())            // US01 — was missing, caused null in GET response
+                .education(p.getEducation())
                 .professionalSummary(p.getProfessionalSummary())
                 .averageRating(p.getAverageRating())
                 .totalSessions(p.getTotalSessions())

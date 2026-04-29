@@ -23,13 +23,17 @@ function RejectModal({ session, onClose, onConfirm }: {
   const [reason, setReason] = useState('');
   return (
     <div className="sb-overlay" onClick={onClose}>
+
       <div className="sb-modal" onClick={e => e.stopPropagation()}>
+
         <h3 className="sb-modal-title">Reject Session Request</h3>
+
         <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.25rem' }}>
           with {session.menteeName} — {new Date(session.scheduledAt).toLocaleString()}
         </p>
 
         <label className="sb-label">Select a reason *</label>
+
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginBottom: '1.5rem', marginTop: '0.5rem' }}>
           {REJECTION_REASONS.map(r => (
             <button key={r} type="button" onClick={() => setReason(r)} style={{
@@ -52,6 +56,7 @@ function RejectModal({ session, onClose, onConfirm }: {
             Confirm Rejection
           </button>
         </div>
+
       </div>
     </div>
   );
@@ -233,6 +238,7 @@ function SessionCard({ session, userRole, onAction }: {
 
           {/* Action buttons */}
           <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '0.75rem' }}>
+
             {/* MENTOR: accept/reject pending */}
             {userRole === 'MENTOR' && session.status === 'PENDING' && (
               <>
